@@ -1,0 +1,240 @@
+###############################################################################
+# Pipeline CI/CD — SL1PCONNECT IoT (Gitea + Woodpecker CI)
+# Compatible aussi avec GitLab CI
+###############################################################################
+
+stages:
+  - lint
+  - test
+  - build
+  - scan
+  - push
+  - deploy
+  - notify
+
+variables:
+  REGISTRY: harbor.slipconnect.com
+  IMAGE_BASE: ${REGISTRY}/iot
+  DOCKER_BUILDKIT: "1"
+  # Liste des services IoT
+  SERVICES: "thread-api tailor-panel stitch-processor fabric-watch"
+
+# ── Ancres YAML ──────────────────────────────────────────────────────────────
+.docker-login: &docker-login
+  before_script:
+    - echo "$HARBOR_PASSWORD" | docker login $REGISTRY -u "$HARBOR_USER" --password-stdin
+
+.only-main: &only-main
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+.only-mr: &only-mr
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE: LINT
+# ══════════════════════════════════════════════════════════════════════════════
+lint-python:
+  stage: lint
+  image: python:3.12-slim
+  script:
+    - pip install pylint --quiet
+    - |
+      for svc in thread-api stitch-processor fabric-watch; do
+        echo "=== Lint $svc ==="
+        pylint services/$svc/ --fail-under=8 || exit 1
+      done
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+lint-node:
+  stage: lint
+  image: node:20-alpine
+  script:
+    - cd services/tailor-panel && npm ci && npm run lint
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+lint-secrets:
+  stage: lint
+  image: zricethezav/gitleaks:v8.21.0
+  script:
+    - gitleaks detect --source . --redact --verbose
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+lint-compose:
+  stage: lint
+  image: docker:27-cli
+  script:
+    - docker compose -f docker-compose.yml config --quiet
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE: TEST
+# ══════════════════════════════════════════════════════════════════════════════
+test-thread-api:
+  stage: test
+  image: python:3.12-slim
+  services:
+    - postgres:16-alpine
+  variables:
+    POSTGRES_DB: test_slipconnect
+    POSTGRES_USER: testuser
+    POSTGRES_PASSWORD: testpassword
+  script:
+    - cd services/thread-api
+    - pip install -r requirements.txt -r requirements-test.txt --quiet
+    - pytest tests/ -v --tb=short --junitxml=../../reports/thread-api-junit.xml
+  artifacts:
+    reports:
+      junit: reports/thread-api-junit.xml
+    expire_in: 1 week
+
+test-stitch-processor:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - cd services/stitch-processor
+    - pip install -r requirements.txt -r requirements-test.txt --quiet
+    - pytest tests/ -v --tb=short
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test-tailor-panel:
+  stage: test
+  image: node:20-alpine
+  script:
+    - cd services/tailor-panel
+    - npm ci
+    - npm test -- --passWithNoTests
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE: BUILD
+# ══════════════════════════════════════════════════════════════════════════════
+build-images:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  <<: *docker-login
+  script:
+    - |
+      for svc in $SERVICES; do
+        echo "=== Build $svc ==="
+        docker build \
+          --build-arg BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+          --build-arg GIT_SHA=$CI_COMMIT_SHORT_SHA \
+          --label "org.opencontainers.image.created=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+          --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+          --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+          -t ${IMAGE_BASE}/${svc}:${CI_COMMIT_SHORT_SHA} \
+          -t ${IMAGE_BASE}/${svc}:${CI_COMMIT_BRANCH} \
+          ./services/${svc}
+      done
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE: SCAN — Trivy (bloquant si CRITICAL)
+# ══════════════════════════════════════════════════════════════════════════════
+scan-vulnerabilities:
+  stage: scan
+  image: aquasec/trivy:latest
+  script:
+    - |
+      FAILED=0
+      for svc in $SERVICES; do
+        echo "=== Scan Trivy $svc ==="
+        trivy image \
+          --exit-code 1 \
+          --severity CRITICAL \
+          --no-progress \
+          --format table \
+          ${IMAGE_BASE}/${svc}:${CI_COMMIT_SHORT_SHA} || FAILED=1
+      done
+      exit $FAILED
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE: PUSH — Harbor Registry
+# ══════════════════════════════════════════════════════════════════════════════
+push-images:
+  stage: push
+  image: docker:27
+  services:
+    - docker:27-dind
+  <<: *docker-login
+  script:
+    - |
+      for svc in $SERVICES; do
+        docker push ${IMAGE_BASE}/${svc}:${CI_COMMIT_SHORT_SHA}
+        docker push ${IMAGE_BASE}/${svc}:${CI_COMMIT_BRANCH}
+        # Tag :latest uniquement sur main
+        if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+          docker tag ${IMAGE_BASE}/${svc}:${CI_COMMIT_SHORT_SHA} ${IMAGE_BASE}/${svc}:latest
+          docker push ${IMAGE_BASE}/${svc}:latest
+        fi
+      done
+  <<: *only-main
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE: DEPLOY — Mise à jour sans downtime
+# ══════════════════════════════════════════════════════════════════════════════
+deploy-prod:
+  stage: deploy
+  image: alpine:3.20
+  environment:
+    name: production
+    url: https://api.slipconnect.com
+  before_script:
+    - apk add --no-cache openssh-client docker-compose
+    - eval $(ssh-agent -s)
+    - echo "$DEPLOY_SSH_KEY" | ssh-add -
+    - mkdir -p ~/.ssh && ssh-keyscan $PROD_HOST >> ~/.ssh/known_hosts
+  script:
+    - |
+      # Mise à jour des images avec TAG pointant sur le nouveau SHA
+      ssh deployer@$PROD_HOST "
+        cd /opt/slipconnect-iot && \
+        TAG=${CI_COMMIT_SHORT_SHA} docker compose pull && \
+        TAG=${CI_COMMIT_SHORT_SHA} docker compose up -d --no-build && \
+        docker compose ps
+      "
+  <<: *only-main
+  when: manual          # Approbation manuelle requise pour prod
+  allow_failure: false
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE: NOTIFY
+# ══════════════════════════════════════════════════════════════════════════════
+notify-success:
+  stage: notify
+  image: alpine:3.20
+  script:
+    - |
+      curl -s -X POST $SLACK_WEBHOOK \
+        -H 'Content-type: application/json' \
+        -d "{\"text\":\":white_check_mark: *[${CI_PROJECT_NAME}]* Pipeline réussi — SHA \`${CI_COMMIT_SHORT_SHA}\` — <${CI_PIPELINE_URL}|Voir le pipeline>\"}"
+  when: on_success
+  <<: *only-main
+
+notify-failure:
+  stage: notify
+  image: alpine:3.20
+  script:
+    - |
+      curl -s -X POST $SLACK_WEBHOOK \
+        -H 'Content-type: application/json' \
+        -d "{\"text\":\":x: *[${CI_PROJECT_NAME}]* Pipeline ÉCHOUÉ — SHA \`${CI_COMMIT_SHORT_SHA}\` — <${CI_PIPELINE_URL}|Voir le pipeline>\"}"
+  when: on_failure

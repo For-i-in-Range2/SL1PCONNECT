@@ -1,0 +1,50 @@
+###############################################################################
+# Traefik — Configuration dynamique (middlewares globaux)
+###############################################################################
+
+http:
+  middlewares:
+
+    # ── Rate limiting ────────────────────────────────────────────────────────
+    rate-limit:
+      rateLimit:
+        average: 100
+        period: 1s
+        burst: 200
+        sourceCriterion:
+          ipStrategy:
+            depth: 1
+
+    # ── Headers de sécurité ──────────────────────────────────────────────────
+    security-headers:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+        accessControlMaxAge: 100
+        hostsProxyHeaders:
+          - "X-Forwarded-Host"
+        stsSeconds: 63072000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        forceSTSHeader: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        permissionsPolicy: "camera=(), microphone=(), geolocation=()"
+        customResponseHeaders:
+          X-Frame-Options: "SAMEORIGIN"
+          X-Content-Type-Options: "nosniff"
+          Server: ""           # Masquer la version du serveur
+
+    # ── Compression ──────────────────────────────────────────────────────────
+    compress:
+      compress: {}
+
+    # ── Authentification dashboard ────────────────────────────────────────────
+    auth-dashboard:
+      basicAuth:
+        usersFile: /etc/traefik/config/dashboard-users.htpasswd
+        realm: "SL1PCONNECT Traefik Dashboard"

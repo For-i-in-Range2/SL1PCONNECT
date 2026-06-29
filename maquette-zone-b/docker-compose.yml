@@ -1,0 +1,476 @@
+###############################################################################
+# SL1PCONNECT — Zone B IoT (OVH)
+# Docker Compose durci — IaC reproductible
+# Usage :
+#   Prod  : docker compose --env-file .env.prod up -d
+#   Dev   : docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml up
+###############################################################################
+
+name: slipconnect-iot
+
+###############################################################################
+# SECRETS — montés depuis fichiers (jamais en variable d'env)
+###############################################################################
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+  db_user:
+    file: ./secrets/db_user.txt
+  api_secret_key:
+    file: ./secrets/api_secret_key.txt
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt
+
+###############################################################################
+# RÉSEAUX ISOLÉS — aucun conteneur sur le réseau par défaut (bridge)
+###############################################################################
+networks:
+  net-front:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+    driver_opts:
+      com.docker.network.bridge.name: br-front
+
+  net-api:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.2.0/24
+    driver_opts:
+      com.docker.network.bridge.name: br-api
+    internal: true          # Pas d'accès internet direct
+
+  net-data:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.3.0/24
+    driver_opts:
+      com.docker.network.bridge.name: br-data
+    internal: true          # Isolé d'internet
+
+  net-monitoring:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.4.0/24
+    driver_opts:
+      com.docker.network.bridge.name: br-monitoring
+    internal: true
+
+###############################################################################
+# VOLUMES NOMMÉS — données persistantes chiffrées at-rest (OVH Block Storage)
+###############################################################################
+volumes:
+  db_data:
+    driver: local
+  nas_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  loki_data:
+    driver: local
+  traefik_certs:
+    driver: local
+
+###############################################################################
+# SERVICES
+###############################################################################
+services:
+
+  # ──────────────────────────────────────────────────────────
+  # REVERSE PROXY — Traefik v3
+  # ──────────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.2
+    container_name: traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    # CRITIQUE : docker.sock NON monté — utilisation de la socket en lecture
+    # seule via provider file (voir traefik/config/dynamic.yml)
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/config:/etc/traefik/config:ro
+      - traefik_certs:/certs
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - net-front
+    labels:
+      - "traefik.enable=true"
+      # Dashboard uniquement en local / VPN — pas exposé publiquement
+      - "traefik.http.routers.traefik-dashboard.rule=Host(`traefik.internal.slipconnect.com`)"
+      - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.traefik-dashboard.tls=true"
+      - "traefik.http.routers.traefik-dashboard.middlewares=auth-dashboard"
+      - "traefik.http.middlewares.auth-dashboard.basicauth.usersfile=/etc/traefik/config/dashboard-users.htpasswd"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────
+  # thread-api — API IoT principale (BLE → cloud)
+  # ──────────────────────────────────────────────────────────
+  thread-api:
+    build:
+      context: ./services/thread-api
+      dockerfile: Dockerfile
+    image: ${REGISTRY:-harbor.slipconnect.com}/iot/thread-api:${TAG:-latest}
+    container_name: thread-api
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1001:1001"
+    secrets:
+      - db_password
+      - db_user
+      - api_secret_key
+    environment:
+      - DB_HOST=db-velvet
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-slipconnect_iot}
+      # Les secrets sont lus depuis /run/secrets/ dans le code
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - DB_USER_FILE=/run/secrets/db_user
+      - SECRET_KEY_FILE=/run/secrets/api_secret_key
+    networks:
+      - net-api
+      - net-data
+    expose:
+      - "8080"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.thread-api.rule=Host(`api.slipconnect.com`) && PathPrefix(`/v1/thread`)"
+      - "traefik.http.routers.thread-api.entrypoints=websecure"
+      - "traefik.http.routers.thread-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.thread-api.middlewares=rate-limit,security-headers"
+      - "traefik.http.services.thread-api.loadbalancer.server.port=8080"
+      - "traefik.docker.network=slipconnect-iot_net-front"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    depends_on:
+      db-velvet:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service=thread-api,env=${ENV:-prod}"
+
+  # ──────────────────────────────────────────────────────────
+  # tailor-panel — Interface de gestion / dashboard
+  # ──────────────────────────────────────────────────────────
+  tailor-panel:
+    build:
+      context: ./services/tailor-panel
+      dockerfile: Dockerfile
+    image: ${REGISTRY:-harbor.slipconnect.com}/iot/tailor-panel:${TAG:-latest}
+    container_name: tailor-panel
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1001:1001"
+    secrets:
+      - jwt_secret
+    environment:
+      - NODE_ENV=production
+      - API_URL=http://thread-api:8080
+      - JWT_SECRET_FILE=/run/secrets/jwt_secret
+    networks:
+      - net-front
+      - net-api
+    expose:
+      - "8081"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.tailor-panel.rule=Host(`panel.slipconnect.com`)"
+      - "traefik.http.routers.tailor-panel.entrypoints=websecure"
+      - "traefik.http.routers.tailor-panel.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.tailor-panel.middlewares=rate-limit,security-headers"
+      - "traefik.http.services.tailor-panel.loadbalancer.server.port=8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    depends_on:
+      thread-api:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ──────────────────────────────────────────────────────────
+  # stitch-processor — Traitement asynchrone des données capteurs
+  # ──────────────────────────────────────────────────────────
+  stitch-processor:
+    build:
+      context: ./services/stitch-processor
+      dockerfile: Dockerfile
+    image: ${REGISTRY:-harbor.slipconnect.com}/iot/stitch-processor:${TAG:-latest}
+    container_name: stitch-processor
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1001:1001"
+    secrets:
+      - db_password
+      - db_user
+    environment:
+      - DB_HOST=db-velvet
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-slipconnect_iot}
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - DB_USER_FILE=/run/secrets/db_user
+    networks:
+      - net-api
+      - net-data
+    expose:
+      - "8082"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    depends_on:
+      db-velvet:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ──────────────────────────────────────────────────────────
+  # fabric-watch — Collecte et exposition des métriques IoT
+  # ──────────────────────────────────────────────────────────
+  fabric-watch:
+    build:
+      context: ./services/fabric-watch
+      dockerfile: Dockerfile
+    image: ${REGISTRY:-harbor.slipconnect.com}/iot/fabric-watch:${TAG:-latest}
+    container_name: fabric-watch
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1001:1001"
+    environment:
+      - THREAD_API_URL=http://thread-api:8080
+      - STITCH_URL=http://stitch-processor:8082
+    networks:
+      - net-api
+      - net-monitoring
+    expose:
+      - "9090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/metrics')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # ──────────────────────────────────────────────────────────
+  # db-velvet — Base de données PostgreSQL
+  # ──────────────────────────────────────────────────────────
+  db-velvet:
+    image: postgres:16-alpine
+    container_name: db-velvet
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    user: "70:70"           # UID postgres dans alpine
+    secrets:
+      - db_password
+      - db_user
+    environment:
+      - POSTGRES_DB=${DB_NAME:-slipconnect_iot}
+      - POSTGRES_USER_FILE=/run/secrets/db_user
+      - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - net-data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $(cat /run/secrets/db_user) -d ${DB_NAME:-slipconnect_iot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ──────────────────────────────────────────────────────────
+  # nas-satin — Stockage fichiers (remplacé par volume partagé)
+  # ──────────────────────────────────────────────────────────
+  nas-satin:
+    image: alpine:3.20
+    container_name: nas-satin
+    restart: unless-stopped
+    user: "1001:1001"
+    read_only: true
+    volumes:
+      - nas_data:/data
+    networks:
+      - net-data
+    command: ["tail", "-f", "/dev/null"]   # Placeholder — remplacer par sftp-server
+
+  # ──────────────────────────────────────────────────────────
+  # Prometheus — Collecte de métriques
+  # ──────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: prometheus
+    restart: unless-stopped
+    user: "65534:65534"     # nobody
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+      - "--web.listen-address=:9091"
+    networks:
+      - net-monitoring
+    expose:
+      - "9091"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────
+  # Grafana — Visualisation
+  # ──────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: grafana
+    restart: unless-stopped
+    user: "472:472"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/api_secret_key
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=https://grafana.slipconnect.com
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+    secrets:
+      - api_secret_key
+    networks:
+      - net-monitoring
+      - net-front
+    expose:
+      - "3000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.slipconnect.com`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────
+  # Loki — Centralisation des logs
+  # ──────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.3.0
+    container_name: loki
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./monitoring/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/loki.yml
+    networks:
+      - net-monitoring
+    expose:
+      - "3100"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3100/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────
+  # Promtail — Agent de collecte de logs
+  # ──────────────────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:3.3.0
+    container_name: promtail
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./monitoring/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/log:/var/log:ro
+      # Lecture des logs Docker (read-only, pas de docker.sock)
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/promtail.yml
+    networks:
+      - net-monitoring
+    depends_on:
+      - loki
