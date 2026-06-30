@@ -1,0 +1,284 @@
+# SL1PCONNECT – Zone B : Docker Swarm (2 nœuds)
+#
+# Architecture :
+#   VM1 (manager) : db-velvet, Grafana, Traefik, socket-proxy
+#   VM2 (worker)  : thread-api (x2), tailor-panel, stitch-processor (x2)
+#
+# Avant de déployer :
+#   1. docker swarm init           (sur VM1)
+#   2. docker swarm join ...       (sur VM2)
+#   3. Créer les secrets           (voir deploy.sh)
+#   4. Builder et pousser images   (voir build.sh)
+#   5. docker stack deploy -c docker-stack.yml sl1p
+#
+# IMPORTANT : build: n'existe pas en Swarm.
+#             Les images doivent être dans le registry local (VM1:5000)
+
+# ── Secrets (créés via docker secret create, jamais dans ce fichier) ──────
+secrets:
+  db_password:
+    external: true
+  jwt_secret:
+    external: true
+  grafana_admin_password:
+    external: true
+
+# ── Configs (fichiers de config injectés dans les conteneurs) ─────────────
+configs:
+  db_init_sql:
+    file: ./db-velvet/init.sql
+
+# ── Réseaux overlay (chiffrement inter-nœuds) ────────────────────────────
+networks:
+  net-front:
+    driver: overlay
+    driver_opts:
+      encrypted: "true"
+  net-api:
+    driver: overlay
+    driver_opts:
+      encrypted: "true"
+  net-data:
+    driver: overlay
+    driver_opts:
+      encrypted: "true"
+  net-monitoring:
+    driver: overlay
+    driver_opts:
+      encrypted: "true"
+  net-proxy:
+    driver: overlay
+
+volumes:
+  velvet-data:
+  grafana-data:
+
+# ── Services ──────────────────────────────────────────────────────────────
+services:
+
+  # ── Reverse proxy ─────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.2
+    command:
+      - --providers.swarm.endpoint=tcp://socket-proxy:2375
+      - --providers.swarm.network=net-front
+      - --providers.swarm.refreshSeconds=15
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --api.dashboard=false
+      - --log.level=WARN
+      - --accesslog=true
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+    networks:
+      - net-front
+      - net-proxy
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+  # Socket proxy : Traefik lit le Swarm sans monter docker.sock directement
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.1.2
+    environment:
+      SERVICES: 1
+      TASKS: 1
+      NETWORKS: 1
+      NODES: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - net-proxy
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+
+  # ── Base de données (nœud manager, données persistantes) ──────────────
+  db-velvet:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: velvet
+      POSTGRES_DB: velvet
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    configs:
+      - source: db_init_sql
+        target: /docker-entrypoint-initdb.d/init.sql
+        mode: 0444
+    volumes:
+      - velvet-data:/var/lib/postgresql/data
+    networks:
+      - net-data
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U velvet"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager    # volume local → toujours sur le manager
+      restart_policy:
+        condition: on-failure
+      update_config:
+        order: stop-first           # postgres ne supporte pas le rolling update
+
+  # ── API Flask (x2 réplicas, répartis sur les 2 nœuds) ────────────────
+  thread-api:
+    image: ${REGISTRY:-127.0.0.1:5000}/sl1p/thread-api:${IMAGE_TAG:-latest}
+    secrets:
+      - db_password
+      - jwt_secret
+    environment:
+      DB_HOST: db-velvet
+      DB_NAME: velvet
+      DB_USER: velvet
+      PORT: "8080"
+    networks:
+      - net-api
+      - net-data
+      - net-front
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      replicas: 2
+      placement:
+        preferences:
+          - spread: node.id         # 1 réplica par nœud si possible
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first          # zero-downtime rolling update
+      labels:
+        # En Swarm les labels Traefik vont sous deploy.labels (pas labels:)
+        - "traefik.enable=true"
+        - "traefik.http.routers.thread-api.rule=Host(`api.sl1pconnect.local`)"
+        - "traefik.http.routers.thread-api.entrypoints=web"
+        - "traefik.http.services.thread-api.loadbalancer.server.port=8080"
+
+  # ── Panel PHP (nœud worker) ───────────────────────────────────────────
+  tailor-panel:
+    image: ${REGISTRY:-127.0.0.1:5000}/sl1p/tailor-panel:${IMAGE_TAG:-latest}
+    secrets:
+      - db_password
+    environment:
+      DB_HOST: db-velvet
+      DB_NAME: velvet
+      DB_USER: velvet
+    networks:
+      - net-front
+      - net-data
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+      restart_policy:
+        condition: on-failure
+      update_config:
+        order: start-first
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.tailor.rule=Host(`panel.sl1pconnect.local`)"
+        - "traefik.http.routers.tailor.entrypoints=web"
+        - "traefik.http.services.tailor.loadbalancer.server.port=80"
+
+  # ── Processeur IoT (x2 réplicas) ─────────────────────────────────────
+  stitch-processor:
+    image: ${REGISTRY:-127.0.0.1:5000}/sl1p/stitch-processor:${IMAGE_TAG:-latest}
+    secrets:
+      - db_password
+    environment:
+      DB_HOST: db-velvet
+      DB_NAME: velvet
+      DB_USER: velvet
+      PORT: "8082"
+    networks:
+      - net-api
+      - net-data
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      replicas: 2
+      placement:
+        preferences:
+          - spread: node.id
+      restart_policy:
+        condition: on-failure
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+
+  # ── Grafana (nœud manager) ────────────────────────────────────────────
+  fabric-watch:
+    image: grafana/grafana:11.4.0
+    user: "472:472"
+    secrets:
+      - grafana_admin_password
+    environment:
+      GF_SECURITY_ADMIN_USER: sl1padmin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - net-monitoring
+      - net-front
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.grafana.rule=Host(`grafana.sl1pconnect.local`)"
+        - "traefik.http.routers.grafana.entrypoints=web"
+        - "traefik.http.services.grafana.loadbalancer.server.port=3000"

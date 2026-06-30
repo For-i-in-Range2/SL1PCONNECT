@@ -1,6 +1,9 @@
 # Secrets Docker – NE JAMAIS COMMITER
 secrets/
 
+# Tag de build genere par build.sh
+.image-tag
+
 # Volumes Docker locaux
 *.db
 *.sqlite
