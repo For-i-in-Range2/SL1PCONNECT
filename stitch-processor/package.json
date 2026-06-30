@@ -1,0 +1,11 @@
+{
+  "name": "stitch-processor",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "4.16.0",
+    "pg": "7.4.0"
+  }
+}

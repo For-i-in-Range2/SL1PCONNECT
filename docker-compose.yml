@@ -1,0 +1,59 @@
+services:
+
+  db-velvet:
+    image: postgres:12
+    environment:
+      POSTGRES_USER: velvet
+      POSTGRES_PASSWORD: velvet
+      POSTGRES_DB: velvet
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db-velvet/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  thread-api:
+    build: ./thread-api
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: db-velvet
+      DB_NAME: velvet
+      DB_USER: velvet
+      DB_PASSWORD: velvet
+      JWT_SECRET: sl1p-super-secret-key-2024
+    depends_on:
+      - db-velvet
+
+  tailor-panel:
+    build: ./tailor-panel
+    ports:
+      - "8081:80"
+    environment:
+      DB_HOST: db-velvet
+      DB_NAME: velvet
+      DB_USER: velvet
+      DB_PASSWORD: velvet
+    depends_on:
+      - db-velvet
+
+  stitch-processor:
+    build: ./stitch-processor
+    ports:
+      - "8082:8082"
+    environment:
+      DB_HOST: db-velvet
+      DB_NAME: velvet
+      DB_USER: velvet
+      DB_PASSWORD: velvet
+    depends_on:
+      - db-velvet
+
+  fabric-watch:
+    build: ./fabric-watch
+    ports:
+      - "9090:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
