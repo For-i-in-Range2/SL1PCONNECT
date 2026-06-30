@@ -138,6 +138,13 @@ services:
       placement:
         constraints:
           - node.role == manager    # volume local → toujours sur le manager
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
       restart_policy:
         condition: on-failure
       update_config:
@@ -170,6 +177,13 @@ services:
       placement:
         preferences:
           - spread: node.id         # 1 réplica par nœud si possible
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
       restart_policy:
         condition: on-failure
         delay: 5s
@@ -208,6 +222,13 @@ services:
       placement:
         constraints:
           - node.role == worker
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 32M
       restart_policy:
         condition: on-failure
       update_config:
@@ -243,6 +264,13 @@ services:
       placement:
         preferences:
           - spread: node.id
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 32M
       restart_policy:
         condition: on-failure
       update_config:
@@ -275,6 +303,13 @@ services:
       placement:
         constraints:
           - node.role == manager
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
       restart_policy:
         condition: on-failure
       labels:
