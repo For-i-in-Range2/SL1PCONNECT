@@ -1,0 +1,38 @@
+# SL1PCONNECT – Reverse-proxy externe (VM3, hors Swarm)
+#
+# À exécuter sur une VM dédiée, en DMZ, séparée du cluster Swarm (VM1/VM2).
+# Seule cette VM est exposée sur Internet (ports 80/443) ; elle ne dispose
+# d'aucun accès à l'API Docker/Swarm, ni au docker.sock du cluster.
+#
+# Usage :
+#   1. Adapter dynamic.yml avec les IP réelles de VM1/VM2
+#   2. docker compose up -d
+
+services:
+  traefik:
+    image: traefik:v3.2
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 32M
