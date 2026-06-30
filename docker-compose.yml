@@ -1,59 +1,192 @@
+# SL1PCONNECT – Zone B : stack durcie
+# Corrections appliquees :
+#   - Secrets via Docker Secrets (plus jamais en variable d'env)
+#   - 4 reseaux isoles (front / api / data / monitoring)
+#   - Port 5432 non expose publiquement
+#   - Plus de docker.sock monte
+#   - Images a jour (postgres:16, grafana:11)
+#   - Healthchecks, read_only, no-new-privileges, user non-root
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password.txt
+
+networks:
+  net-front:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+  net-api:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.2.0/24
+  net-data:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.3.0/24
+  net-monitoring:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.4.0/24
+
+volumes:
+  velvet-data:
+  grafana-data:
+
 services:
 
   db-velvet:
-    image: postgres:12
+    image: postgres:16-alpine
+    # user: "999:999"  # postgres user inside the official image
     environment:
       POSTGRES_USER: velvet
-      POSTGRES_PASSWORD: velvet
       POSTGRES_DB: velvet
-    ports:
-      - "5432:5432"
+      # POSTGRES_PASSWORD_FILE lit le secret, jamais de mot de passe en clair
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
     volumes:
-      - ./db-velvet/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./db-velvet/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - velvet-data:/var/lib/postgresql/data
+    # PORT 5432 : NON expose a l'host (correction #1)
+    networks:
+      - net-data
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U velvet"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
   thread-api:
     build: ./thread-api
-    ports:
-      - "8080:8080"
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    secrets:
+      - db_password
+      - jwt_secret
     environment:
       DB_HOST: db-velvet
       DB_NAME: velvet
       DB_USER: velvet
-      DB_PASSWORD: velvet
-      JWT_SECRET: sl1p-super-secret-key-2024
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - net-api
+      - net-data
+    security_opt:
+      - no-new-privileges:true
     depends_on:
-      - db-velvet
+      db-velvet:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
   tailor-panel:
     build: ./tailor-panel
-    ports:
-      - "8081:80"
+    user: "33:33"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/apache2
+      - /var/lock/apache2
+      - /var/log/apache2
+    secrets:
+      - db_password
     environment:
       DB_HOST: db-velvet
       DB_NAME: velvet
       DB_USER: velvet
-      DB_PASSWORD: velvet
+    ports:
+      - "127.0.0.1:8081:80"
+    networks:
+      - net-front
+      - net-data
+    security_opt:
+      - no-new-privileges:true
     depends_on:
-      - db-velvet
+      db-velvet:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
   stitch-processor:
     build: ./stitch-processor
-    ports:
-      - "8082:8082"
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    secrets:
+      - db_password
     environment:
       DB_HOST: db-velvet
       DB_NAME: velvet
       DB_USER: velvet
-      DB_PASSWORD: velvet
+      PORT: "8082"
+    ports:
+      - "127.0.0.1:8082:8082"
+    networks:
+      - net-api
+      - net-data
+    security_opt:
+      - no-new-privileges:true
     depends_on:
-      - db-velvet
+      db-velvet:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
   fabric-watch:
-    build: ./fabric-watch
-    ports:
-      - "9090:3000"
+    # Grafana 11 – pas de docker.sock (correction #2)
+    image: grafana/grafana:11.4.0
+    user: "472:472"
+    read_only: true
+    tmpfs:
+      - /tmp
+    secrets:
+      - grafana_admin_password
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: sl1padmin
+      # Lit le secret depuis le fichier, jamais en clair
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:9090
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:9090:3000"
+    networks:
+      - net-monitoring
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
