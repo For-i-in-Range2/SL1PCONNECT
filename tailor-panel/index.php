@@ -87,7 +87,7 @@ if (isset($_GET['logout'])) {
 }
 
 // ── Endpoint de healthcheck ───────────────────────────────────────
-if ($_SERVER['REQUEST_URI'] === '/health') {
+if (isset($_GET['health'])) {
     header('Content-Type: application/json');
     echo json_encode(['status' => 'ok', 'service' => 'tailor-panel']);
     exit;
