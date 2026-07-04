@@ -6,6 +6,7 @@
  *   2. Injection SQL corrigee : requetes preparees (PDO)
  *   3. Auth contre la BDD avec password_verify() (bcrypt)
  *   4. Session renforcee (regenerate ID, cookie httponly/samesite)
+ *   5. Jeton CSRF sur tous les formulaires POST (double-submit pattern)
  */
 
 // ── Lecture du secret Docker ──────────────────────────────────────
@@ -45,24 +46,37 @@ ini_set('session.cookie_samesite', 'Strict');
 ini_set('session.use_strict_mode', '1');
 session_start();
 
+// Correction #5 : génération du jeton CSRF à l'initialisation de la session
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
 // ── Authentification ──────────────────────────────────────────────
 if (isset($_POST['login']) && $pdo) {
-    $email    = $_POST['username'] ?? '';
-    $password = $_POST['password'] ?? '';
-
-    // Correction #3 : verification contre la BDD, jamais de login en dur
-    $stmt = $pdo->prepare("SELECT id, password_hash, role FROM users WHERE email = ?");
-    $stmt->execute([$email]);
-    $u = $stmt->fetch();
-
-    if ($u && password_verify($password, $u['password_hash'])) {
-        // Regeneration de l'ID de session (prevention de fixation de session)
-        session_regenerate_id(true);
-        $_SESSION['auth'] = true;
-        $_SESSION['role'] = $u['role'];
-        $_SESSION['uid']  = $u['id'];
+    // Correction #5 : validation CSRF avant tout traitement
+    $submitted_token = $_POST['csrf_token'] ?? '';
+    if (!hash_equals($_SESSION['csrf_token'], $submitted_token)) {
+        $error = "Requête invalide.";
     } else {
-        $error = "Identifiants invalides";
+        $email    = $_POST['username'] ?? '';
+        $password = $_POST['password'] ?? '';
+
+        // Correction #3 : verification contre la BDD, jamais de login en dur
+        $stmt = $pdo->prepare("SELECT id, password_hash, role FROM users WHERE email = ?");
+        $stmt->execute([$email]);
+        $u = $stmt->fetch();
+
+        if ($u && password_verify($password, $u['password_hash'])) {
+            // Regeneration de l'ID de session (prevention de fixation de session)
+            session_regenerate_id(true);
+            // Renouvelle le jeton CSRF après connexion réussie
+            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+            $_SESSION['auth'] = true;
+            $_SESSION['role'] = $u['role'];
+            $_SESSION['uid']  = $u['id'];
+        } else {
+            $error = "Identifiants invalides";
+        }
     }
 }
 
@@ -73,7 +87,7 @@ if (isset($_GET['logout'])) {
 }
 
 // ── Endpoint de healthcheck ───────────────────────────────────────
-if ($_SERVER['REQUEST_URI'] === '/health') {
+if (isset($_GET['health'])) {
     header('Content-Type: application/json');
     echo json_encode(['status' => 'ok', 'service' => 'tailor-panel']);
     exit;
@@ -102,6 +116,7 @@ function h($s): string {
 <?php if (empty($_SESSION['auth'])): ?>
   <?php if (!empty($error)) echo "<p style='color:#C00000'>" . h($error) . "</p>"; ?>
   <form method="post">
+    <input type="hidden" name="csrf_token" value="<?php echo h($_SESSION['csrf_token']); ?>">
     <input name="username" type="email" placeholder="email" required>
     <input name="password" type="password" placeholder="mot de passe" required>
     <button name="login" value="1">Connexion</button>

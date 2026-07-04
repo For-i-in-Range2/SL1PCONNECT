@@ -1,8 +1,17 @@
-# SL1PCONNECT – Zone B : Docker Swarm (2 nœuds)
+# SL1PCONNECT – Zone B : Docker Swarm (2 nœuds) + reverse-proxy externe
 #
 # Architecture :
-#   VM1 (manager) : db-velvet, Grafana, Traefik, socket-proxy
-#   VM2 (worker)  : thread-api (x2), tailor-panel, stitch-processor (x2)
+#   VM1 (manager)     : db-velvet, Grafana          [interne, jamais exposé direct]
+#   VM2 (worker)      : thread-api (x2), tailor-panel, stitch-processor (x2)
+#   VM3 (hors Swarm)  : Traefik, en DMZ              [voir ./reverse-proxy/]
+#
+#   VM3 ne fait PAS partie du cluster Swarm et n'a aucun accès à l'API
+#   Docker/Swarm (isolation totale). Elle route le trafic vers VM1/VM2 via
+#   le routing mesh Swarm : un port publié (ports: ci-dessous) est joignable
+#   sur N'IMPORTE QUEL nœud du cluster, qui relaie en interne vers le
+#   conteneur réel, même s'il tourne sur l'autre nœud. C'est ce qui permet à
+#   VM3 de ne connaître QUE les IP de VM1/VM2 + un port, sans jamais savoir
+#   où les conteneurs sont réellement placés.
 #
 # Avant de déployer :
 #   1. docker swarm init           (sur VM1)
@@ -10,6 +19,7 @@
 #   3. Créer les secrets           (voir deploy.sh)
 #   4. Builder et pousser images   (voir build.sh)
 #   5. docker stack deploy -c docker-stack.yml sl1p
+#   6. Configurer et lancer le reverse-proxy sur VM3 (voir ./reverse-proxy/)
 #
 # IMPORTANT : build: n'existe pas en Swarm.
 #             Les images doivent être dans le registry local (VM1:5000)
@@ -29,11 +39,9 @@ configs:
     file: ./db-velvet/init.sql
 
 # ── Réseaux overlay (chiffrement inter-nœuds) ────────────────────────────
+# net-front et net-proxy ont disparu : ils ne servaient qu'à la connectivité
+# Traefik <-> socket-proxy <-> services, désormais hors Swarm (VM3).
 networks:
-  net-front:
-    driver: overlay
-    driver_opts:
-      encrypted: "true"
   net-api:
     driver: overlay
     driver_opts:
@@ -46,68 +54,15 @@ networks:
     driver: overlay
     driver_opts:
       encrypted: "true"
-  net-proxy:
-    driver: overlay
 
 volumes:
   velvet-data:
   grafana-data:
 
 # ── Services ──────────────────────────────────────────────────────────────
+# Le reverse-proxy (Traefik) ne fait plus partie du Swarm : voir ./reverse-proxy/
+# Il route vers les services ci-dessous via les ports publiés (routing mesh).
 services:
-
-  # ── Reverse proxy ─────────────────────────────────────────────────────
-  traefik:
-    image: traefik:v3.2
-    command:
-      - --providers.swarm.endpoint=tcp://socket-proxy:2375
-      - --providers.swarm.network=net-front
-      - --providers.swarm.refreshSeconds=15
-      - --entrypoints.web.address=:80
-      - --entrypoints.websecure.address=:443
-      - --api.dashboard=false
-      - --log.level=WARN
-      - --accesslog=true
-    ports:
-      - target: 80
-        published: 80
-        protocol: tcp
-        mode: host
-      - target: 443
-        published: 443
-        protocol: tcp
-        mode: host
-    networks:
-      - net-front
-      - net-proxy
-    deploy:
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-
-  # Socket proxy : Traefik lit le Swarm sans monter docker.sock directement
-  socket-proxy:
-    image: tecnativa/docker-socket-proxy:0.1.2
-    environment:
-      SERVICES: 1
-      TASKS: 1
-      NETWORKS: 1
-      NODES: 1
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - net-proxy
-    deploy:
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      restart_policy:
-        condition: on-failure
 
   # ── Base de données (nœud manager, données persistantes) ──────────────
   db-velvet:
@@ -138,6 +93,13 @@ services:
       placement:
         constraints:
           - node.role == manager    # volume local → toujours sur le manager
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
       restart_policy:
         condition: on-failure
       update_config:
@@ -154,10 +116,15 @@ services:
       DB_NAME: velvet
       DB_USER: velvet
       PORT: "8080"
+    ports:
+      # Routing mesh : joignable sur le port 8080 de N'IMPORTE QUEL nœud Swarm
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: ingress
     networks:
       - net-api
       - net-data
-      - net-front
     security_opt:
       - no-new-privileges:true
     healthcheck:
@@ -170,6 +137,13 @@ services:
       placement:
         preferences:
           - spread: node.id         # 1 réplica par nœud si possible
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
       restart_policy:
         condition: on-failure
         delay: 5s
@@ -177,12 +151,6 @@ services:
         parallelism: 1
         delay: 10s
         order: start-first          # zero-downtime rolling update
-      labels:
-        # En Swarm les labels Traefik vont sous deploy.labels (pas labels:)
-        - "traefik.enable=true"
-        - "traefik.http.routers.thread-api.rule=Host(`api.sl1pconnect.local`)"
-        - "traefik.http.routers.thread-api.entrypoints=web"
-        - "traefik.http.services.thread-api.loadbalancer.server.port=8080"
 
   # ── Panel PHP (nœud worker) ───────────────────────────────────────────
   tailor-panel:
@@ -193,13 +161,18 @@ services:
       DB_HOST: db-velvet
       DB_NAME: velvet
       DB_USER: velvet
+    ports:
+      # Routing mesh : joignable sur le port 8081 de N'IMPORTE QUEL nœud Swarm
+      - target: 80
+        published: 8081
+        protocol: tcp
+        mode: ingress
     networks:
-      - net-front
       - net-data
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fs http://localhost/index.php?health=1 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -208,15 +181,17 @@ services:
       placement:
         constraints:
           - node.role == worker
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 32M
       restart_policy:
         condition: on-failure
       update_config:
         order: start-first
-      labels:
-        - "traefik.enable=true"
-        - "traefik.http.routers.tailor.rule=Host(`panel.sl1pconnect.local`)"
-        - "traefik.http.routers.tailor.entrypoints=web"
-        - "traefik.http.services.tailor.loadbalancer.server.port=80"
 
   # ── Processeur IoT (x2 réplicas) ─────────────────────────────────────
   stitch-processor:
@@ -234,7 +209,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8082/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -243,6 +218,13 @@ services:
       placement:
         preferences:
           - spread: node.id
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 32M
       restart_policy:
         condition: on-failure
       update_config:
@@ -262,9 +244,14 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana-data:/var/lib/grafana
+    ports:
+      # Routing mesh : joignable sur le port 9090 de N'IMPORTE QUEL nœud Swarm
+      - target: 3000
+        published: 9090
+        protocol: tcp
+        mode: ingress
     networks:
       - net-monitoring
-      - net-front
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
       interval: 30s
@@ -275,10 +262,12 @@ services:
       placement:
         constraints:
           - node.role == manager
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
       restart_policy:
         condition: on-failure
-      labels:
-        - "traefik.enable=true"
-        - "traefik.http.routers.grafana.rule=Host(`grafana.sl1pconnect.local`)"
-        - "traefik.http.routers.grafana.entrypoints=web"
-        - "traefik.http.services.grafana.loadbalancer.server.port=3000"

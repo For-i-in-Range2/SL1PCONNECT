@@ -38,3 +38,18 @@ Pour `tailor-panel`, ouvrir http://localhost:8081, se connecter, puis rechercher
 
 Cette stack est fournie **en l'état**, telle que déployée à l'origine. À vous de l'auditer,
 de la durcir et de l'intégrer à une chaîne CI/CD (build, scan d'images, tests, déploiement).
+
+## Architecture de production (3 VM)
+
+`docker-compose.yml` ci-dessus sert au dev local sur une seule machine. La cible
+production utilise un Swarm à 2 nœuds (`docker-stack.yml`) + un reverse-proxy
+externe sur une 3ᵉ VM en DMZ, hors cluster (voir [`reverse-proxy/`](./reverse-proxy/)) :
+
+```
+Internet → VM3 (Traefik, DMZ)  →  routing mesh Swarm  →  VM1 (manager) / VM2 (worker)
+```
+
+Pipeline de build/scan/déploiement : voir [`Makefile`](./Makefile) (`make help`).
+
+Procédure complète de déploiement sur 3 VM (Swarm + reverse-proxy) :
+voir [`RUNBOOK.md`](./RUNBOOK.md).

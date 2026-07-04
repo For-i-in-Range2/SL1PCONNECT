@@ -1,0 +1,58 @@
+# Configuration dynamique de Traefik – routage vers le cluster Swarm
+#
+# IMPORTANT : remplacer VM1_IP et VM2_IP par les IP réelles des nœuds Swarm
+# avant de déployer (ou générer ce fichier via un templating IaC : Ansible,
+# envsubst, etc. — voir reverse-proxy/README.md).
+#
+# Grâce au routing mesh Swarm, les DEUX nœuds répondent sur le port publié
+# même si le conteneur ne tourne que sur l'un des deux : lister les deux IP
+# ici apporte donc de la haute disponibilité supplémentaire au niveau de
+# Traefik (si un nœud tombe, son healthcheck échoue et il est retiré du LB).
+
+http:
+  routers:
+    thread-api:
+      rule: "Host(`api.sl1pconnect.local`)"
+      entryPoints: ["web"]
+      service: thread-api
+
+    tailor-panel:
+      rule: "Host(`panel.sl1pconnect.local`)"
+      entryPoints: ["web"]
+      service: tailor-panel
+
+    grafana:
+      rule: "Host(`grafana.sl1pconnect.local`)"
+      entryPoints: ["web"]
+      service: grafana
+
+  services:
+    thread-api:
+      loadBalancer:
+        servers:
+          - url: "http://VM1_IP:8080"
+          - url: "http://VM2_IP:8080"
+        healthCheck:
+          path: /health
+          interval: "10s"
+          timeout: "3s"
+
+    tailor-panel:
+      loadBalancer:
+        servers:
+          - url: "http://VM1_IP:8081"
+          - url: "http://VM2_IP:8081"
+        healthCheck:
+          path: /health
+          interval: "10s"
+          timeout: "3s"
+
+    grafana:
+      loadBalancer:
+        servers:
+          - url: "http://VM1_IP:9090"
+          - url: "http://VM2_IP:9090"
+        healthCheck:
+          path: /api/health
+          interval: "10s"
+          timeout: "3s"

@@ -5,7 +5,11 @@ Corrections :
   2. Secrets lus depuis /run/secrets/ (Docker Secrets)
   3. JWT signe avec HS256 via PyJWT (plus de concatenation triviale)
   4. Mot de passe verifie via bcrypt (plus de plaintext)
+  5. JWT verifie sur toutes les routes sensibles (require_jwt)
+  6. Validation des entrees (heart_rate, posture, user_id)
+  7. Controle d'acces : un utilisateur ne voit que ses propres donnees
 """
+import functools
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -40,6 +44,30 @@ DB = dict(
     password=read_secret("db_password"),        # secret, pas d'env var
     port=int(os.environ.get("DB_PORT", "5432")),
 )
+
+# ------------------------------------------------------------------
+# Décorateur d'authentification JWT
+# ------------------------------------------------------------------
+
+VALID_POSTURES = {"standing", "sitting", "lying", "walking"}
+
+def require_jwt(f):
+    """Vérifie le Bearer JWT dans Authorization; injecte le payload dans request."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify(error="authentication required"), 401
+        token = auth[7:]
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return jsonify(error="token expired"), 401
+        except jwt.InvalidTokenError:
+            return jsonify(error="invalid token"), 401
+        request.jwt_payload = payload
+        return f(*args, **kwargs)
+    return decorated
 
 # ------------------------------------------------------------------
 # Connexion DB avec retry
@@ -102,26 +130,50 @@ def login():
 
 
 @app.route("/api/sensors", methods=["POST"])
+@require_jwt
 def add_sensor():
-    # TODO: verifier le JWT avant d'accepter les donnees
     data = request.get_json(force=True, silent=True) or {}
+
+    # Validation : user_id doit correspondre au sujet du JWT
+    user_id = data.get("user_id")
+    if user_id != request.jwt_payload.get("sub"):
+        return jsonify(error="forbidden"), 403
+
+    # Validation : heart_rate obligatoire, plage physiologique raisonnable
+    heart_rate = data.get("heart_rate")
+    if not isinstance(heart_rate, (int, float)) or not (20 <= heart_rate <= 300):
+        return jsonify(error="invalid heart_rate"), 400
+
+    # Validation : posture dans la liste autorisée (None accepté)
+    posture = data.get("posture")
+    if posture is not None and posture not in VALID_POSTURES:
+        return jsonify(error="invalid posture"), 400
+
+    fall_detected = bool(data.get("fall_detected", False))
+
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO health_data (user_id, heart_rate, fall_detected, posture) "
         "VALUES (%s, %s, %s, %s) RETURNING id",
-        (data.get("user_id"), data.get("heart_rate"),
-         data.get("fall_detected", False), data.get("posture")),
+        (user_id, heart_rate, fall_detected, posture),
     )
     new_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
     conn.close()
-    return jsonify(id=new_id, status="recorded")
+    return jsonify(id=new_id, status="recorded"), 201
 
 
 @app.route("/api/sensors/<int:user_id>")
+@require_jwt
 def get_sensors(user_id):
+    # Un utilisateur ne peut voir que ses propres données ; les admins voient tout
+    jwt_sub = request.jwt_payload.get("sub")
+    role = request.jwt_payload.get("role", "user")
+    if jwt_sub != user_id and role != "admin":
+        return jsonify(error="forbidden"), 403
+
     conn = get_db()
     cur = conn.cursor()
     cur.execute(

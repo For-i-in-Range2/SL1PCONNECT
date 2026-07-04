@@ -1,0 +1,26 @@
+# Configuration statique de Traefik – VM3 (hors Swarm)
+#
+# Pas de provider Docker/Swarm ici : cette VM n'a aucun accès à l'API
+# Docker. Le routage est entièrement défini dans dynamic.yml (fichier
+# statique versionné = IaC, pas de "clic manuel").
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+api:
+  dashboard: false
+
+ping: {}
+
+log:
+  level: WARN
+
+accessLog: {}
